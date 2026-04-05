@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Pytest / Coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+
+# Project specific
+chrome_profile/
+chrome_profile*/
+captcha_samples/
+logs/
+.env
+config.yaml
+tg_bot.log
+dc_bot.log
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+.claude/
