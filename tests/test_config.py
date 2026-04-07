@@ -6,6 +6,7 @@ import pytest
 
 from ticket_bot.config import (
     SessionConfig,
+    TakeoverConfig,
     load_config,
 )
 
@@ -315,3 +316,63 @@ def test_session_config_defaults():
     assert s.user_data_dir == "./chrome_profile"
     assert s.proxy_server == ""
     assert s.cookie_file == ""
+
+
+def test_takeover_config_defaults():
+    takeover = TakeoverConfig()
+
+    assert takeover.enabled is False
+    assert takeover.debug_port == 9222
+    assert takeover.page_url_substring == "vscinemas.com.tw"
+    assert takeover.resolved_cdp_url() == "http://127.0.0.1:9222"
+
+
+def test_load_config_vieshow_takeover_nested(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        textwrap.dedent(
+            """\
+            events: []
+            vieshow:
+              takeover:
+                enabled: true
+                debug_port: 9333
+                page_url_substring: "sales.vscinemas.com.tw"
+            """
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+
+    cfg = load_config(str(tmp_path / "config.yaml"), str(tmp_path / ".env"))
+
+    assert cfg.vieshow.takeover.enabled is True
+    assert cfg.vieshow.takeover.debug_port == 9333
+    assert cfg.vieshow.takeover.page_url_substring == "sales.vscinemas.com.tw"
+    assert cfg.vieshow.takeover.resolved_cdp_url() == "http://127.0.0.1:9333"
+    assert cfg.vieshow.takeover_mode is True
+    assert cfg.vieshow.attach_cdp_url == "http://127.0.0.1:9333"
+
+
+def test_load_config_vieshow_takeover_legacy_aliases(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        textwrap.dedent(
+            """\
+            events: []
+            browser:
+              takeover_from_current_page: true
+              attach_cdp_url: "http://127.0.0.1:9444"
+              attach_page_url_substring: "ticketing"
+            vieshow:
+              takeover_mode: true
+            """
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+
+    cfg = load_config(str(tmp_path / "config.yaml"), str(tmp_path / ".env"))
+
+    assert cfg.vieshow.takeover.enabled is True
+    assert cfg.vieshow.takeover.cdp_url == "http://127.0.0.1:9444"
+    assert cfg.vieshow.takeover.page_url_substring == "ticketing"
+    assert cfg.vieshow.attach_page_url_substring == "ticketing"

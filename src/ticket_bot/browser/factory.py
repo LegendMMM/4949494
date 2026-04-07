@@ -1,27 +1,38 @@
-"""根據設定建立對應的瀏覽器引擎"""
+"""Browser engine factory."""
 
 from __future__ import annotations
 
+import logging
+
 from ticket_bot.browser.base import BrowserEngine
+
+logger = logging.getLogger(__name__)
 
 
 def create_engine(engine_name: str) -> BrowserEngine:
-    """
-    工廠函式：根據名稱建立瀏覽器引擎。
-
-    Args:
-        engine_name: "nodriver" 或 "playwright"
-    """
+    """Create a browser engine instance."""
     name = engine_name.lower().strip()
 
     if name == "nodriver":
-        from ticket_bot.browser.nodriver_engine import NodriverEngine
+        try:
+            from ticket_bot.browser.nodriver_engine import NodriverEngine
+        except Exception as exc:
+            logger.warning(
+                "nodriver unavailable, falling back to Playwright: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            from ticket_bot.browser.playwright_engine import PlaywrightEngine
+
+            return PlaywrightEngine()
         return NodriverEngine()
 
     if name == "playwright":
         from ticket_bot.browser.playwright_engine import PlaywrightEngine
+
         return PlaywrightEngine()
 
     raise ValueError(
-        f"不支援的瀏覽器引擎: {engine_name!r}，可選: nodriver, playwright"
+        f"Unsupported browser engine: {engine_name!r}. "
+        "Expected one of: nodriver, playwright"
     )

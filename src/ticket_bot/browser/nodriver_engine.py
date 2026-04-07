@@ -371,8 +371,12 @@ class NodriverEngine(BrowserEngine):
         lang: str = "zh-TW",
         proxy_server: str = "",
         extra_args: list[str] | None = None,
+        attach_cdp_url: str = "",
+        attach_page_url_substring: str = "",
     ) -> None:
         import platform
+        if attach_cdp_url:
+            raise RuntimeError("NodriverEngine does not support attaching to an existing Chrome session")
         browser_args = list(extra_args or [])
         browser_args.extend([
             "--disable-blink-features=AutomationControlled",

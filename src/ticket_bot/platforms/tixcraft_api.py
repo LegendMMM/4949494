@@ -244,7 +244,7 @@ class TixcraftApiBot(TixcraftBot):
 
     @staticmethod
     def _watch_sleep_seconds(interval: float, target_count: int) -> float:
-        return interval
+        return max(interval / max(target_count, 1), 0.5)
 
     def _record_watch_hit(self, status_code: int, latency_ms: float) -> None:
         """記錄 watch 單次請求結果"""

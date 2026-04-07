@@ -7,7 +7,7 @@ import logging
 
 import click
 
-from ticket_bot.config import load_config
+from ticket_bot.config import EventConfig, SessionConfig, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,11 @@ def _create_platform_bot(cfg, ev, session, use_api: bool = False):
         from ticket_bot.platforms.kktix import KKTIXBot
 
         return KKTIXBot(cfg, ev, session=session)
+
+    if ev.platform == "vieshow":
+        from ticket_bot.platforms.vieshow import VieShowBot
+
+        return VieShowBot(cfg, ev, session=session)
 
     if use_api:
         from ticket_bot.platforms.tixcraft_api import TixcraftApiBot
@@ -298,7 +303,7 @@ def list_games(ctx):
 
 
 @cli.command()
-@click.option("--platform", type=click.Choice(["auto", "tixcraft", "kktix"]), default="auto", help="登入平台")
+@click.option("--platform", type=click.Choice(["auto", "tixcraft", "kktix", "vieshow"]), default="auto", help="登入平台")
 @click.pass_context
 def login(ctx, platform):
     """開啟瀏覽器讓你手動登入票務網站（登入後按 Enter 關閉）"""
@@ -306,7 +311,12 @@ def login(ctx, platform):
     target_platform = platform
     if target_platform == "auto":
         target_platform = cfg.events[0].platform if cfg.events else "tixcraft"
-    login_url = "https://kktix.com/users/sign_in" if target_platform == "kktix" else "https://tixcraft.com/login"
+    login_urls = {
+        "kktix": "https://kktix.com/users/sign_in",
+        "vieshow": "https://www.vscinemas.com.tw/",
+        "tixcraft": "https://tixcraft.com/login",
+    }
+    login_url = login_urls.get(target_platform, "https://tixcraft.com/login")
 
     async def _login():
         from ticket_bot.browser import create_engine
@@ -342,10 +352,10 @@ def login(ctx, platform):
 @click.option("--api", is_flag=True, help="使用獨立 API 高速結帳模式")
 @click.pass_context
 def run(ctx, event, date_kw, area_kw, ticket_count, dry_run, parallel, api):
-    """啟動搶票（支援 tixcraft / kktix）"""
+    """啟動搶票（支援 tixcraft / kktix / vieshow）"""
     cfg = load_config(ctx.obj["config_path"])
 
-    targets = [e for e in cfg.events if e.platform in {"tixcraft", "kktix"}]
+    targets = [e for e in cfg.events if e.platform in {"tixcraft", "kktix", "vieshow"}]
     if event:
         targets = [e for e in targets if event in e.name]
     if not targets:
@@ -412,7 +422,7 @@ def watch(ctx, event, date_kw, area_kw, ticket_count, interval, parallel):
     """釋票監測模式 — 持續刷新，有票自動搶"""
     cfg = load_config(ctx.obj["config_path"])
 
-    targets = [e for e in cfg.events if e.platform in {"tixcraft", "kktix"}]
+    targets = [e for e in cfg.events if e.platform in {"tixcraft", "kktix", "vieshow"}]
     if event:
         targets = [e for e in targets if event in e.name]
     if not targets:
@@ -530,17 +540,16 @@ def countdown(ctx, event, parallel):
 
     cfg = load_config(ctx.obj["config_path"])
 
-    targets = [e for e in cfg.events if e.platform == "tixcraft" and e.sale_time]
+    targets = [e for e in cfg.events if e.platform in {"tixcraft", "vieshow"} and e.sale_time]
     if event:
         targets = [e for e in targets if event in e.name]
     if not targets:
-        click.echo("找不到有設定 sale_time 的 tixcraft 活動")
+        click.echo("找不到有設定 sale_time 的活動（支援 tixcraft / vieshow）")
         return
 
     sessions = cfg.sessions
 
     async def _countdown():
-        from ticket_bot.platforms.tixcraft import TixcraftBot
         from ticket_bot.utils.timer import countdown_activate
         import time as _time
 
@@ -571,7 +580,7 @@ def countdown(ctx, event, parallel):
             # 預熱所有 sessions
             bots = []
             for sess in sessions:
-                bot = TixcraftBot(cfg, ev, session=sess)
+                bot = _create_platform_bot(cfg, ev, sess)
                 await bot.start_browser()
                 await bot.pre_warm()
                 bots.append((bot, sess))
@@ -762,6 +771,74 @@ def monitor(ctx, keywords, interval):
 
 
 @cli.command()
+@click.option("--event", help="指定 VieShow 活動名稱（部分比對）")
+@click.option("--debug-port", default=None, type=int, help="接手 Chrome 的 remote debugging port")
+@click.option("--page-url-substring", default=None, help="優先接手網址包含此關鍵字的分頁")
+@click.option("--count", "ticket_count", default=None, type=int, help="票數（覆蓋 config）")
+@click.option(
+    "--ticket-type",
+    default=None,
+    type=click.Choice(["full", "student", "ishow", "senior", "love"]),
+    help="票種（覆蓋 config）",
+)
+@click.option("--seat-preference", default=None, help="座位偏好（如 center / front / back / F12,F13）")
+@click.pass_context
+def takeover(ctx, event, debug_port, page_url_substring, ticket_count, ticket_type, seat_preference):
+    """VieShow 接管模式：附著到你手動操作中的 Chrome 分頁繼續搶座。"""
+    cfg = load_config(ctx.obj["config_path"])
+
+    targets = [e for e in cfg.events if e.platform == "vieshow"]
+    if event:
+        targets = [e for e in targets if event in e.name]
+    ev = targets[0] if targets else EventConfig(
+        name="VieShow Takeover",
+        platform="vieshow",
+        url="https://www.vscinemas.com.tw/vsTicketing/ticketing/ticket.aspx",
+        ticket_count=cfg.events[0].ticket_count if cfg.events else 2,
+    )
+
+    if ticket_count is not None:
+        ev.ticket_count = ticket_count
+    if ticket_type is not None:
+        cfg.vieshow.ticket_type = ticket_type
+    if seat_preference is not None:
+        cfg.vieshow.seat_preference = seat_preference
+
+    takeover_cfg = cfg.vieshow.takeover
+    takeover_cfg.enabled = True
+    if debug_port is not None:
+        takeover_cfg.debug_port = debug_port
+        takeover_cfg.cdp_url = ""
+    if page_url_substring is not None:
+        takeover_cfg.page_url_substring = page_url_substring
+
+    cfg.vieshow.takeover = takeover_cfg
+    cfg.vieshow.takeover_mode = True
+    cfg.vieshow.attach_cdp_url = takeover_cfg.resolved_cdp_url()
+    cfg.vieshow.attach_page_url_substring = takeover_cfg.page_url_substring
+    cfg.browser.takeover_from_current_page = True
+    cfg.browser.attach_cdp_url = takeover_cfg.resolved_cdp_url()
+    cfg.browser.attach_page_url_substring = takeover_cfg.page_url_substring
+
+    session = cfg.sessions[0] if cfg.sessions else SessionConfig()
+
+    async def _takeover():
+        from ticket_bot.platforms.vieshow import VieShowBot
+
+        bot = VieShowBot(cfg, ev, session=session)
+        try:
+            success = await bot.run()
+            if success:
+                click.echo("已完成接手流程，請在 Chrome 中確認結帳頁內容並手動付款。")
+            else:
+                click.echo("接手流程未成功完成。")
+        finally:
+            await bot.close()
+
+    asyncio.run(_takeover())
+
+
+@cli.command()
 @click.option("--dir", "collect_dir", default="", help="驗證碼收集目錄（預設從 config 讀取）")
 @click.pass_context
 def label(ctx, collect_dir):
@@ -790,3 +867,21 @@ def prepare(ctx, collect_dir, output_dir):
 
     click.echo(f"準備訓練資料: {collect_dir}\n")
     prepare_training_data(collect_dir, output_dir)
+
+
+@cli.command()
+@click.option("--port", default=5000, type=int, help="Web UI 監聽埠號（預設 5000）")
+@click.option("--host", default="127.0.0.1", help="監聽位址")
+@click.pass_context
+def web(ctx, port, host):
+    """啟動 Web UI 控制面板（威秀影城搶票）"""
+    from ticket_bot.web.app import create_app
+
+    config_path = ctx.obj["config_path"]
+    app = create_app(config_path)
+
+    click.echo("威秀影城搶票機器人 — Web UI")
+    click.echo(f"開啟瀏覽器前往: http://{host}:{port}")
+    click.echo("按 Ctrl+C 停止\n")
+
+    app.run(host=host, port=port, debug=False)

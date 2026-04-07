@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "vieshow-web",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "ticket_bot", "web", "--port", "5000"],
+      "port": 5000
+    }
+  ]
+}

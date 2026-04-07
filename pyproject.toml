@@ -23,6 +23,7 @@ dependencies = [
     "discord.py>=2.3",
     "anthropic>=0.40",
     "curl_cffi>=0.7.0",
+    "flask>=3.0",
 ]
 
 [project.optional-dependencies]

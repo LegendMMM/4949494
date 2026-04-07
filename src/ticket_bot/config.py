@@ -31,9 +31,27 @@ class BrowserConfig:
     user_data_dir: str = "./chrome_profile"
     pre_warm: bool = True
     lang: str = "zh-TW"
-    executable_path: str = "/usr/bin/chromium"
+    executable_path: str = ""  # 留空讓 nodriver/playwright 自動偵測 Chrome 路徑
     api_mode: str = "off"  # "off" | "checkout" | "full"
     turbo_mode: bool = True  # 極速模式：JS 填充與送出，不模擬人類打字行為
+    attach_cdp_url: str = ""
+    attach_page_url_substring: str = ""
+    takeover_from_current_page: bool = False
+
+
+@dataclass
+class TakeoverConfig:
+    """VieShow 接管模式設定。"""
+
+    enabled: bool = False
+    cdp_url: str = ""
+    debug_port: int = 9222
+    page_url_substring: str = "vscinemas.com.tw"
+
+    def resolved_cdp_url(self) -> str:
+        if self.cdp_url:
+            return self.cdp_url
+        return f"http://127.0.0.1:{self.debug_port}"
 
 
 @dataclass
@@ -99,6 +117,24 @@ class KKTIXAutofillConfig:
 
 
 @dataclass
+class VieShowConfig:
+    """威秀影城搶票設定"""
+    theater_code: str = ""           # 影城代碼：TP, MU, NL...
+    theater_keyword: str = ""        # 或用影城名稱關鍵字搜尋
+    movie_keyword: str = ""          # 電影名稱關鍵字
+    showtime_keyword: str = ""       # 場次關鍵字（如 IMAX, 19:30）
+    ticket_type: str = "full"        # full / student / ishow
+    seat_preference: str = "center"  # center / front / back 或指定座位如 "F12,F13"
+    ishow_email: str = ""
+    ishow_password: str = ""
+    auto_login: bool = True
+    takeover: TakeoverConfig = field(default_factory=TakeoverConfig)
+    takeover_mode: bool = False
+    attach_cdp_url: str = ""
+    attach_page_url_substring: str = "vscinemas.com.tw"
+
+
+@dataclass
 class DeploymentConfig:
     profile: str = ""
 
@@ -120,6 +156,7 @@ class AppConfig:
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
     kktix: KKTIXAutofillConfig = field(default_factory=KKTIXAutofillConfig)
+    vieshow: VieShowConfig = field(default_factory=VieShowConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     trace: TraceConfig = field(default_factory=TraceConfig)
@@ -324,6 +361,43 @@ def load_config(config_path: str = "config.yaml", env_path: str = ".env") -> App
     kktix_raw = raw.get("kktix", {})
     kktix = KKTIXAutofillConfig(**kktix_raw)
 
+    # 解析 VieShow 威秀影城設定
+    vieshow_raw = raw.get("vieshow", {}).copy()
+    if os.getenv("VIESHOW_ISHOW_EMAIL"):
+        vieshow_raw["ishow_email"] = os.getenv("VIESHOW_ISHOW_EMAIL")
+    if os.getenv("VIESHOW_ISHOW_PASSWORD"):
+        vieshow_raw["ishow_password"] = os.getenv("VIESHOW_ISHOW_PASSWORD")
+    takeover_raw = vieshow_raw.pop("takeover", {}) or {}
+    legacy_takeover_enabled = bool(
+        takeover_raw.get("enabled")
+        or vieshow_raw.get("takeover_mode")
+        or browser.takeover_from_current_page
+        or browser.attach_cdp_url
+    )
+    if "enabled" not in takeover_raw:
+        takeover_raw["enabled"] = legacy_takeover_enabled
+    if not takeover_raw.get("cdp_url"):
+        takeover_raw["cdp_url"] = (
+            vieshow_raw.get("attach_cdp_url")
+            or browser.attach_cdp_url
+            or ""
+        )
+    if not takeover_raw.get("page_url_substring"):
+        takeover_raw["page_url_substring"] = (
+            vieshow_raw.get("attach_page_url_substring")
+            or browser.attach_page_url_substring
+            or "vscinemas.com.tw"
+        )
+    takeover = TakeoverConfig(**takeover_raw)
+    vieshow_raw["takeover"] = takeover
+    vieshow_raw["takeover_mode"] = bool(vieshow_raw.get("takeover_mode") or takeover.enabled)
+    vieshow_raw["attach_cdp_url"] = vieshow_raw.get("attach_cdp_url") or takeover.resolved_cdp_url()
+    vieshow_raw["attach_page_url_substring"] = (
+        vieshow_raw.get("attach_page_url_substring")
+        or takeover.page_url_substring
+    )
+    vieshow = VieShowConfig(**vieshow_raw)
+
     # 解析 notifications（合併 .env 機密）
     notif_raw = _deep_merge(profile_preset.get("notifications", {}), raw.get("notifications", {}))
     tg_raw = notif_raw.get("telegram", {})
@@ -386,6 +460,7 @@ def load_config(config_path: str = "config.yaml", env_path: str = ".env") -> App
         browser=browser,
         captcha=captcha,
         kktix=kktix,
+        vieshow=vieshow,
         notifications=notifications,
         proxy=proxy,
         trace=trace,

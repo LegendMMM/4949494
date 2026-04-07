@@ -1,23 +1,58 @@
-"""Playwright + playwright-stealth 引擎實作"""
+"""Playwright browser engine implementation."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import os
+import tempfile
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
 
 from ticket_bot.browser.base import BrowserEngine, ElementHandle, PageWrapper
 
 logger = logging.getLogger(__name__)
 
+STEALTH_INIT_SCRIPT = """
+(() => {
+    try {
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+        });
+
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['zh-TW', 'zh', 'en-US', 'en'],
+        });
+
+        Object.defineProperty(navigator, 'platform', {
+            get: () => 'Win32',
+        });
+
+        const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+        if (originalQuery) {
+            window.navigator.permissions.query = (parameters) => (
+                parameters && parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery.call(window.navigator.permissions, parameters)
+            );
+        }
+
+        if (window.chrome && !window.chrome.runtime) {
+            window.chrome.runtime = {};
+        }
+    } catch (_) {
+        // Ignore stealth patch failures.
+    }
+})();
+"""
+
 
 class PlaywrightElement(ElementHandle):
-    """Playwright 元素封裝"""
-
     def __init__(self, locator_or_handle, page: Page):
         self._el = locator_or_handle
         self._page = page
@@ -28,7 +63,7 @@ class PlaywrightElement(ElementHandle):
 
     async def send_keys(self, text: str) -> None:
         import random
-        # 模擬人類打字延遲，避免被防爬蟲機制判定為機器人
+
         await self._el.type(text, delay=random.randint(50, 150))
 
     async def query_selector(self, selector: str) -> ElementHandle | None:
@@ -39,7 +74,6 @@ class PlaywrightElement(ElementHandle):
 
     @property
     def text(self) -> str:
-        # ElementHandle 的 text 需要 async，這裡用 cached 值
         return self._cached_text
 
     def _set_text(self, text: str) -> None:
@@ -47,8 +81,6 @@ class PlaywrightElement(ElementHandle):
 
 
 class PlaywrightPage(PageWrapper):
-    """Playwright 頁面封裝"""
-
     def __init__(self, page: Page):
         self._page = page
 
@@ -73,10 +105,10 @@ class PlaywrightPage(PageWrapper):
     async def select_all(self, selector: str) -> list[ElementHandle]:
         handles = await self._page.query_selector_all(selector)
         result = []
-        for h in handles:
-            el = PlaywrightElement(h, self._page)
+        for handle in handles:
+            el = PlaywrightElement(handle, self._page)
             try:
-                text = await h.inner_text()
+                text = await handle.inner_text()
             except Exception:
                 text = ""
             el._set_text(text)
@@ -94,20 +126,27 @@ class PlaywrightPage(PageWrapper):
 
     async def get_all_cookies(self) -> list[dict]:
         cookies = await self._page.context.cookies()
-        return [{"name": c["name"], "value": c["value"], "domain": c.get("domain", ""),
-                 "path": c.get("path", "/"), "httpOnly": c.get("httpOnly", False),
-                 "secure": c.get("secure", False)} for c in cookies]
+        return [
+            {
+                "name": cookie["name"],
+                "value": cookie["value"],
+                "domain": cookie.get("domain", ""),
+                "path": cookie.get("path", "/"),
+                "httpOnly": cookie.get("httpOnly", False),
+                "secure": cookie.get("secure", False),
+            }
+            for cookie in cookies
+        ]
 
     async def set_cookies(self, cookies: list[dict]) -> None:
-        """透過 Playwright context.add_cookies 設定 cookies"""
         formatted = []
-        for c in cookies:
-            entry = {"name": c["name"], "value": c["value"]}
-            if "url" in c:
-                entry["url"] = c["url"]
-            elif "domain" in c:
-                entry["domain"] = c["domain"]
-                entry["path"] = c.get("path", "/")
+        for cookie in cookies:
+            entry = {"name": cookie["name"], "value": cookie["value"]}
+            if "url" in cookie:
+                entry["url"] = cookie["url"]
+            elif "domain" in cookie:
+                entry["domain"] = cookie["domain"]
+                entry["path"] = cookie.get("path", "/")
             else:
                 entry["url"] = "https://tixcraft.com"
             formatted.append(entry)
@@ -115,23 +154,23 @@ class PlaywrightPage(PageWrapper):
             await self._page.context.add_cookies(formatted)
 
     async def block_urls(self, patterns: list[str]) -> None:
-        """透過 Playwright route 封鎖追蹤/廣告資源"""
         try:
-            substrings = [p.strip("*") for p in patterns if p.strip("*")]
+            substrings = [pattern.strip("*") for pattern in patterns if pattern.strip("*")]
 
             async def _abort(route):
                 await route.abort()
 
             await self._page.route(
-                lambda url: any(s in str(url) for s in substrings),
+                lambda url: any(substring in str(url) for substring in substrings),
                 _abort,
             )
-            logger.info("已封鎖 %d 個追蹤資源 URL pattern", len(patterns))
-        except Exception as e:
-            logger.warning("封鎖追蹤資源失敗: %s", e)
+            logger.info("Blocked %d URL patterns", len(patterns))
+        except Exception as exc:
+            logger.warning("Failed to block URL patterns: %s", exc)
 
     def on_response_callback(self, url_pattern: str, callback: callable) -> None:
         import re
+
         regex = re.compile(url_pattern)
 
         async def handle_response(response):
@@ -139,8 +178,8 @@ class PlaywrightPage(PageWrapper):
                 try:
                     body = await response.body()
                     callback(body)
-                except Exception as e:
-                    logger.debug(f"Intercept response error: {e}")
+                except Exception as exc:
+                    logger.debug("Intercept response error: %s", exc)
 
         self._page.on("response", handle_response)
 
@@ -158,64 +197,59 @@ class PlaywrightPage(PageWrapper):
                             "url": response.url,
                             "status_code": response.status,
                             "method": getattr(response.request, "method", ""),
-                            "headers": [
-                                (item["name"], item["value"])
-                                for item in headers
-                            ],
+                            "headers": [(item["name"], item["value"]) for item in headers],
                         }
                     )
-                except Exception as e:
-                    logger.debug("Intercept response event error: %s", e)
+                except Exception as exc:
+                    logger.debug("Intercept response event error: %s", exc)
 
         self._page.on("response", handle_response)
 
     async def handle_cloudflare(self, timeout: float = 15.0) -> bool:
-        """偵測並通過 Cloudflare Turnstile（Playwright 版）"""
         try:
-            has_cf = await self._page.evaluate("""
+            has_cf = await self._page.evaluate(
+                """
                 (() => {
                     const text = document.body?.innerText || '';
-                    const hasCfText = /verify you are human|checking your browser|請確認您是真人|正在執行安全驗證|請啟用 javascript (?:and|與) cookies? 以繼續/i.test(text);
+                    const hasCfText = /verify you are human|checking your browser/i.test(text);
                     const hasCfFrame = !!document.querySelector('iframe[src*="challenges.cloudflare.com"]');
                     return hasCfText || hasCfFrame;
                 })()
-            """)
+                """
+            )
             if not has_cf:
                 return True
 
-            logger.info("偵測到 Cloudflare 挑戰，嘗試通過...")
-
-            # 找 CF iframe 並點擊 checkbox
+            logger.info("Cloudflare challenge detected, trying to continue")
             cf_frame = self._page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
             checkbox = cf_frame.locator('input[type="checkbox"], .cb-lb')
             try:
                 await checkbox.click(timeout=timeout * 1000)
             except Exception:
-                # Fallback: 點擊 iframe 中央
                 iframe = self._page.locator('iframe[src*="challenges.cloudflare.com"]')
                 if await iframe.count() > 0:
                     await iframe.click()
 
-            # 等待通過
-            import asyncio as _asyncio
             elapsed = 0.0
             while elapsed < timeout:
-                await _asyncio.sleep(1.0)
+                await asyncio.sleep(1.0)
                 elapsed += 1.0
-                still_cf = await self._page.evaluate("""
+                still_cf = await self._page.evaluate(
+                    """
                     (() => {
                         const text = document.body?.innerText || '';
-                        return /verify you are human|checking your browser|正在執行安全驗證|安全驗證/i.test(text);
+                        return /verify you are human|checking your browser/i.test(text);
                     })()
-                """)
+                    """
+                )
                 if not still_cf:
-                    logger.info("Cloudflare 挑戰已通過")
+                    logger.info("Cloudflare challenge cleared")
                     return True
 
-            logger.warning("Cloudflare 等待逾時")
+            logger.warning("Cloudflare challenge timeout")
             return False
-        except Exception as e:
-            logger.warning("Cloudflare 處理失敗 (Playwright): %s", e)
+        except Exception as exc:
+            logger.warning("Cloudflare handling failed: %s", exc)
             return False
 
     async def screenshot(self) -> bytes:
@@ -226,13 +260,66 @@ class PlaywrightPage(PageWrapper):
 
 
 class PlaywrightEngine(BrowserEngine):
-    """Playwright 瀏覽器引擎（Chromium + stealth）"""
+    """Playwright browser engine."""
 
     def __init__(self):
         self._playwright = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._stealth = Stealth()
+        self._attached_via_cdp = False
+        self._attach_page_url_substring = ""
+
+    @staticmethod
+    def _detect_browser_executable() -> str:
+        candidates = [
+            os.getenv("BROWSER_EXECUTABLE_PATH", ""),
+            os.getenv("CHROME_EXECUTABLE_PATH", ""),
+            os.path.join(os.getenv("ProgramFiles", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.getenv("ProgramFiles(x86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.getenv("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.getenv("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(os.getenv("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(os.getenv("LOCALAPPDATA", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+
+        for path in candidates:
+            if path and os.path.exists(path):
+                return path
+        return ""
+
+    @staticmethod
+    def _resolve_user_data_dir(user_data_dir: str) -> str:
+        if not user_data_dir:
+            return ""
+
+        path = Path(user_data_dir).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+
+        path_str = str(path)
+        try:
+            path_str.encode("ascii")
+            path.mkdir(parents=True, exist_ok=True)
+            return path_str
+        except UnicodeEncodeError:
+            safe_root = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "ticket-bot-public" / "profiles"
+            safe_root.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.sha1(path_str.encode("utf-8")).hexdigest()[:10]
+            safe_path = safe_root / f"profile_{digest}"
+            safe_path.mkdir(parents=True, exist_ok=True)
+            logger.warning(
+                "Non-ASCII user_data_dir detected, remapping Playwright profile from %s to %s",
+                path_str,
+                safe_path,
+            )
+            return str(safe_path)
 
     @staticmethod
     def _build_proxy_config(proxy_server: str) -> dict[str, str] | None:
@@ -254,6 +341,63 @@ class PlaywrightEngine(BrowserEngine):
             config["password"] = parsed.password
         return config
 
+    async def _install_context_stealth(self) -> None:
+        if not self._context:
+            return
+
+        try:
+            await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+        except Exception as exc:
+            logger.debug("Failed to add context init script: %s", exc)
+
+        for page in list(self._context.pages):
+            await self._apply_page_stealth(page)
+
+        def _handle_new_page(page: Page) -> None:
+            asyncio.create_task(self._apply_page_stealth(page))
+
+        self._context.on("page", _handle_new_page)
+
+    async def _apply_page_stealth(self, page: Page) -> None:
+        try:
+            await page.add_init_script(STEALTH_INIT_SCRIPT)
+        except Exception:
+            pass
+
+        try:
+            await self._stealth.apply_stealth_async(page)
+        except Exception as exc:
+            logger.debug("Failed to apply page stealth: %s", exc)
+
+    async def _select_existing_page(self) -> Page | None:
+        if not self._context:
+            return None
+
+        pages = [page for page in self._context.pages if page.url not in ("", "about:blank")]
+        if not pages:
+            return None
+
+        if self._attach_page_url_substring:
+            matched = [page for page in pages if self._attach_page_url_substring in page.url]
+            if not matched:
+                return None
+            pages = matched
+
+        for page in reversed(pages):
+            try:
+                if await page.evaluate("() => document.hasFocus()"):
+                    await page.bring_to_front()
+                    return page
+            except Exception:
+                continue
+
+        page = pages[-1]
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        return page
+
     async def launch(
         self,
         *,
@@ -263,37 +407,89 @@ class PlaywrightEngine(BrowserEngine):
         lang: str = "zh-TW",
         proxy_server: str = "",
         extra_args: list[str] | None = None,
+        attach_cdp_url: str = "",
+        attach_page_url_substring: str = "",
     ) -> None:
         self._playwright = await async_playwright().start()
+        self._attached_via_cdp = False
+        self._attach_page_url_substring = attach_page_url_substring.strip()
+
+        if attach_cdp_url:
+            self._browser = await self._playwright.chromium.connect_over_cdp(attach_cdp_url)
+            if self._browser.contexts:
+                self._context = self._browser.contexts[0]
+            else:
+                self._context = await self._browser.new_context(
+                    locale=lang,
+                    viewport={"width": 1280, "height": 800},
+                    timezone_id="Asia/Taipei",
+                )
+            self._attached_via_cdp = True
+            await self._install_context_stealth()
+            logger.info("Playwright attached over CDP: %s", attach_cdp_url)
+            return
+
+        if not executable_path:
+            executable_path = self._detect_browser_executable()
+            if executable_path:
+                logger.info("Using system browser executable: %s", executable_path)
 
         launch_args = list(extra_args or [])
         launch_args.append("--disable-blink-features=AutomationControlled")
 
-        kwargs: dict[str, Any] = dict(
-            headless=headless,
-            args=launch_args,
-        )
+        kwargs: dict[str, Any] = {
+            "headless": headless,
+            "args": launch_args,
+            "ignore_default_args": ["--enable-automation"],
+        }
         if executable_path:
             kwargs["executable_path"] = executable_path
 
-        proxy_config = None
-        if proxy_server:
-            proxy_config = self._build_proxy_config(proxy_server)
+        proxy_config = self._build_proxy_config(proxy_server) if proxy_server else None
 
         if user_data_dir:
-            # persistent context = 自帶 user profile
-            context_kwargs: dict[str, Any] = dict(
-                user_data_dir=user_data_dir,
-                locale=lang,
-                viewport={"width": 1280, "height": 800},
+            resolved_user_data_dir = self._resolve_user_data_dir(user_data_dir)
+            context_kwargs: dict[str, Any] = {
+                "user_data_dir": resolved_user_data_dir,
+                "locale": lang,
+                "viewport": {"width": 1280, "height": 800},
+                "timezone_id": "Asia/Taipei",
                 **kwargs,
-            )
+            }
             if proxy_config:
                 context_kwargs["proxy"] = proxy_config
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                **context_kwargs,
-            )
-            self._browser = None  # persistent context 沒有獨立 browser 物件
+            try:
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    **context_kwargs,
+                )
+                self._browser = None
+            except Exception as exc:
+                logger.warning(
+                    "Persistent Playwright context failed for %s, falling back to non-persistent mode: %s",
+                    resolved_user_data_dir,
+                    exc,
+                )
+                fallback_profile = tempfile.mkdtemp(prefix="ticket-bot-pw-")
+                fallback_kwargs = dict(context_kwargs)
+                fallback_kwargs["user_data_dir"] = fallback_profile
+                try:
+                    self._context = await self._playwright.chromium.launch_persistent_context(
+                        **fallback_kwargs,
+                    )
+                    self._browser = None
+                except Exception as fallback_exc:
+                    logger.warning(
+                        "Temporary persistent context failed, falling back to ephemeral browser: %s",
+                        fallback_exc,
+                    )
+                    if proxy_config:
+                        kwargs["proxy"] = proxy_config
+                    self._browser = await self._playwright.chromium.launch(**kwargs)
+                    self._context = await self._browser.new_context(
+                        locale=lang,
+                        viewport={"width": 1280, "height": 800},
+                        timezone_id="Asia/Taipei",
+                    )
         else:
             if proxy_config:
                 kwargs["proxy"] = proxy_config
@@ -301,25 +497,35 @@ class PlaywrightEngine(BrowserEngine):
             self._context = await self._browser.new_context(
                 locale=lang,
                 viewport={"width": 1280, "height": 800},
+                timezone_id="Asia/Taipei",
             )
 
-        logger.info("Playwright 瀏覽器啟動完成")
+        await self._install_context_stealth()
+        logger.info("Playwright browser launched")
 
     async def new_page(self, url: str = "") -> PageWrapper:
         if not self._context:
-            raise RuntimeError("瀏覽器尚未啟動，請先呼叫 launch()")
+            raise RuntimeError("Browser engine is not launched")
 
         page = None
+        if self._attached_via_cdp:
+            page = await self._select_existing_page()
+            if page is None:
+                target = self._attach_page_url_substring or "the current browser tab"
+                raise RuntimeError(f"找不到可接手的既有分頁：{target}")
+
         existing_pages = list(self._context.pages)
-        for existing in existing_pages:
-            if existing.url in ("", "about:blank"):
-                page = existing
-                break
+        if page is None:
+            for existing in existing_pages:
+                if existing.url in ("", "about:blank"):
+                    page = existing
+                    break
         if page is None and len(existing_pages) == 1:
             page = existing_pages[0]
         if page is None:
             page = await self._context.new_page()
-        await self._stealth.apply_stealth_async(page)
+
+        await self._apply_page_stealth(page)
 
         if url:
             await page.goto(url, wait_until="domcontentloaded")
@@ -327,13 +533,15 @@ class PlaywrightEngine(BrowserEngine):
         return PlaywrightPage(page)
 
     async def close(self) -> None:
-        if self._context:
+        if self._context and not self._attached_via_cdp:
             await self._context.close()
-            self._context = None
-        if self._browser:
+        self._context = None
+        if self._browser and not self._attached_via_cdp:
             await self._browser.close()
-            self._browser = None
+        self._browser = None
         if self._playwright:
             await self._playwright.stop()
             self._playwright = None
-        logger.info("Playwright 瀏覽器已關閉")
+        self._attached_via_cdp = False
+        self._attach_page_url_substring = ""
+        logger.info("Playwright browser closed")

@@ -8,6 +8,14 @@ events:
     sale_time: ""                  # 倒數模式用，ISO 8601 格式，如 "2026-04-15T12:00:00+08:00"
     presale_code: ""
 
+  # 威秀影城範例
+  # - name: "電影名稱"
+  #   platform: vieshow
+  #   url: "https://www.vscinemas.com.tw/vsTicketing/ticketing/ticket.aspx"
+  #   ticket_count: 2
+  #   date_keyword: "19:30"          # 場次時間關鍵字
+  #   sale_time: ""                  # 開賣倒數，如 "2026-04-08T12:00:00+08:00"
+
 browser:
   engine: nodriver                 # nodriver（推薦）或 playwright
   headless: false
@@ -44,6 +52,18 @@ proxy:
 trace:
   enabled: false
   log_path: "./logs/tixcraft_trace.jsonl" # 記錄 cf-ray / redirect / set-cookie 名稱摘要
+
+# 威秀影城設定（Web UI 也可在網頁上設定，不一定要改這裡）
+vieshow:
+  theater_code: ""                 # 影城代碼：TP=信義, MU=松仁MUVIE, NL=南港, QS=京站, BQ=板橋...
+  theater_keyword: ""              # 或用影城名稱關鍵字（如「信義」）
+  movie_keyword: ""                # 電影名稱關鍵字
+  showtime_keyword: ""             # 場次關鍵字（如 "IMAX", "19:30"）
+  ticket_type: "full"              # full=全票 / student=優待票 / ishow=iShow會員票
+  seat_preference: "center"        # center=中間 / front=前排 / back=後排 / 或指定座位如 "F12,F13"
+  ishow_email: ""                  # iShow 會員帳號（建議放 .env：VIESHOW_ISHOW_EMAIL）
+  ishow_password: ""               # iShow 會員密碼（建議放 .env：VIESHOW_ISHOW_PASSWORD）
+  auto_login: true                 # 有填帳密時自動登入
 
 # Gemma 4 AI 助手（本地推理）
 gemma:

@@ -97,6 +97,8 @@ class BrowserEngine(abc.ABC):
         lang: str = "zh-TW",
         proxy_server: str = "",
         extra_args: list[str] | None = None,
+        attach_cdp_url: str = "",
+        attach_page_url_substring: str = "",
     ) -> None:
         """啟動瀏覽器"""
 
